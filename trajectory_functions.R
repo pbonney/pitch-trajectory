@@ -9,12 +9,13 @@ grav	<- 32.174
 dt.c	<- 0.001
 t.max	<- 1.1		# Don't simulate beyond this many seconds of elapsed time
 y.min	<- -3		# Don't simulate beyond this many feet behind home plate
-y.flag	<- 17/12	# front of home plate
-x.l	<- (-8.5-1.45)/12
-x.r	<- (8.5+1.45)/12
+y.h	<- 17/12	# front of home plate
+x.l	<- (-8.5-1.45)/12   # left side of home plate, with an adjustment for the radius of the ball
+x.r	<- (8.5+1.45)/12    # right side of home plate, with an adjustment for the radius of the ball
 
 # Air density in lb/ft^3 at temperature temp (in degrees C), elevation elev (in m), 
-# pressure p (in mm Hg), relative humidity rh (%)
+# pressure p (in mm Hg), relative humidity rh (%), saturation vapor pressure svp 
+# (as calculated by svp.f())
 rho.f <- function(temp,elev,p,rh,svp) {
 	1.2929*(273/(temp+273)*(p*exp(-1*beta*elev)-0.3783*rh*svp/100)/760)*0.06261
 }
@@ -40,16 +41,57 @@ re100.f <- function(temp,rho) {
 }
 
 #
+# spin.nine.param:
+#
+# Function for calculating the 3D spin of a pitch based on the "nine parameter fit model",
+# plus a constant c0 that reflects game conditions.
+#
+spin.nine.param <- function(x0,y0,z0,v0z,v0y,v0z,ax,ay,az,c0) {
+    v0      <- sqrt(vx0^2+vy0^2+vz0^2)          # overall initial velocity
+    vyf     <- -1*sqrt(vy0^2-2*ay*(y0-y.h))     # vy at front of home plate
+    time    <- (vyf-vy0)/ay                     # flight time of pitch (from (x0,y0,z0), not release point)
+    vxbar   <- (2*vx0+ax*time)/2                # mean vx over flight time
+    vybar   <- (2*vy0+ay*time)/2                # mean vy over flight time
+    vzbar   <- (2*vz0+az*time)/2                # mean vz over flight time
+    vbar    <- sqrt(vxbar^2+vybar^2+vzbar^2)    # mean total velocity over flight time
+    adrag   <- -1*(ax*vxbar+ay*vybar+(az+grav)*vzbar)/vbar  # accelaration along flight path due to drag
+    amagx   <- ax+vxbar*adrag/vbar              # accelaration due to magnus force in x-dimension
+    amagy   <- ay+vybar*adrag/vbar              # accelaration due to magnus force in y-dimension
+    amagz   <- az+vzbar*adrag/vbar+grav         # accelaration due to magnus force in z-dimension (note adjustment for gravity)
+    amag    <- sqrt(amagx^2+amagy^2+amagz^2)    # accelaration due to magnus force along flight path
+    Cl      <- amag/(c0*vbar^2)                 # lift coefficient for current game conditions
+    wxc     <- (vybar*amagz-vzbar*amagy)/(vbar*amag)    # cosine of spin direction from perspective of x-dimension
+    wzc   <- (vxbar*amagy-vybar*amagx)/(vbar*amag)      # cosine of spin direction from perspective of z-dimension
+    phispin   <- ifelse(wzc>0,atan2(wzc,wxc)*180/pi,360+atan2(wzc,wxc)*180/pi)  # angle of spin projection in x-z plane with respect to x axis, running counterclockwise from batter's perspective
+    S <- 0.4*Cl/(1-2.32*Cl)                     # spin parameter based on Cl; calculation reflects best experimental fit
+    spin  <- 80*S*vbar                          # spin in RPM, without gyro-spin component
+
+    wb      <- -1*spin * cos(mapply(degrees.to.radians.f,phispin))  # back-spin
+    ws      <- spin * sin(mapply(degrees.to.radians.f,phispin))     # side-spin
+    wg      <- 0    # gyro-spin, which has no effect on movement and can be assumed to be 0
+    theta   <- asin(vz0/v0)
+    phi     <- atan2(vx0,vy0)
+
+    wx      <- (wb*cos(phi)-ws*sin(theta)*sin(phi)+wg*vx0/v0)*pi/30     # spin in the x-dimension
+    wy      <- (-1*wb*sin(phi)-ws*sin(theta)*cos(phi)+wg*vy0/v0)*pi/30  # spin in the y-dimension
+    wz      <- (ws*cos(theta)+wg*vz0/v0)*pi/30                          # spin in the z-dimension
+
+    return(c(wx,wy,wz))
+}
+
+#
 # pitch.trajectory:
 #
 # Function for describing the full trajectory of a pitch based on initial conditions.
 #
-# Takes the "9 parameters" from the "9 parameter fit model" (x0,y0,z0,v0x,v0y,v0z,wx,wy,wz)
+# Takes initial position, velocity and spin in 3 dimensions (x0,y0,z0,v0x,v0y,v0z,wx,wy,wz)
 # plus a constant c0 that reflects game conditions.
 #
 # Returns a data frame describing the pitch conditions at each time increment (dt.c).
 #
-
+# 3D spin (wx,wy,wz) is calculated using the "nine parameter fit model", which is implemented
+# in the spin.nine.param() function.
+#
 pitch.trajectory <- function(x0,y0,z0,v0x,v0y,v0z,wx,wy,wz,c0) {
 	
 	# initialize some local variables
@@ -212,10 +254,10 @@ in.zone.2d <- function(x,z,zt,zb) {
 # L[[1]] returns v1 as a vector and L[[2]] returns v2 as a vector; L[[2]][3] would give the z component of v2.
 pitch.plate.crossings <- function(x0,y0,z0,v0x,v0y,v0z,wx,wy,wz,c0) {
 	traj.df	<- pitch.trajectory(x0,y0,z0,v0x,v0y,v0z,wx,wy,wz,c0)
-	v1	<- pitch.coords.at.y(traj.df,y.flag)
+	v1	<- pitch.coords.at.y(traj.df,y.h)
 	v2	<- pitch.coords.at.y(traj.df,0)
 #	return(list(v1,v2))
-	return(c(v1,v2))	# Note: it is easier to work with results after the fact when in a single array rather than a list of arrays
+	return(c(v1,v2))	# Note: for convenience I return a single array rather than a list of arrays. To return a list of arrays uncomment the prior line.
 }
 
 # Variation: calculate the change in coordinates as the ball traverses the plate. So we can
@@ -223,7 +265,7 @@ pitch.plate.crossings <- function(x0,y0,z0,v0x,v0y,v0z,wx,wy,wz,c0) {
 # my own starting and ending coordinates, calculate the change and use THEIR starting coordinates)
 pitch.plate.movement <- function(x0,y0,z0,v0x,v0y,v0z,v0,wx,wy,wz,c0) {
 	traj.df	<- pitch.trajectory(x0,y0,z0,v0x,v0y,v0z,wx,wy,wz,omega,c0)
-	v1	<- pitch.coords.at.y(traj.df,y.flag)
+	v1	<- pitch.coords.at.y(traj.df,y.h)
 	v2	<- pitch.coords.at.y(traj.df,0)
 	return(c(v2[1]-v1[1],v2[2]-v1[2],v2[3]-v1[3]))
 }
